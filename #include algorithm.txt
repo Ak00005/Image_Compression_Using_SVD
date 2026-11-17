@@ -1,0 +1,563 @@
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <omp.h>
+#include <string>
+#include <turbojpeg.h>
+#include <vector>
+
+using namespace std;
+
+// Block dimension: 32x32 as required
+constexpr int BLOCK_SIZE = 32;
+
+// Custom SVD compressed representation for each 32x32 block
+struct SVDBlock {
+  std::vector<float> sigma; // Top K singular values (positive floats)
+  std::vector<std::int8_t>
+      U; // Top K left singular vectors (quantized to int8 [-127, 127])
+  std::vector<std::int8_t>
+      V; // Top K right singular vectors (quantized to int8 [-127, 127])
+};
+
+// Binary header for the custom .svd file format
+#pragma pack(push, 1)
+struct SVDHeader {
+  char magic[4];             // "SVD1"
+  std::uint32_t width;       // Original image width
+  std::uint32_t height;      // Original image height
+  std::uint32_t blockSize;   // Block dimension (32)
+  std::uint32_t K;           // Number of singular components kept
+  std::uint32_t totalBlocks; // Total number of 32x32 blocks
+};
+#pragma pack(pop)
+
+// Compute SVD of a 32x32 matrix using Jacobi eigenvalue decomposition on A^T *
+// A
+void computeBlockSVD(const float A[BLOCK_SIZE][BLOCK_SIZE], int K,
+                     SVDBlock &outBlock) {
+  outBlock.sigma.resize(K);
+  outBlock.U.resize(K * BLOCK_SIZE);
+  outBlock.V.resize(K * BLOCK_SIZE);
+
+  // 1. Form symmetric positive semi-definite matrix S = A^T * A (32x32)
+  double S[BLOCK_SIZE][BLOCK_SIZE];
+  for (int i = 0; i < BLOCK_SIZE; ++i) {
+    for (int j = i; j < BLOCK_SIZE; ++j) {
+      double sum = 0.0;
+      for (int k = 0; k < BLOCK_SIZE; ++k) {
+        sum += static_cast<double>(A[k][i]) * static_cast<double>(A[k][j]);
+      }
+      S[i][j] = sum;
+      S[j][i] = sum;
+    }
+  }
+
+  // 2. Initialize right singular vector matrix V as identity matrix I (32x32)
+  double V[BLOCK_SIZE][BLOCK_SIZE] = {0};
+  for (int i = 0; i < BLOCK_SIZE; ++i) {
+    V[i][i] = 1.0;
+  }
+
+  // 3. Classical Jacobi sweeps to diagonalize S (A^T * A)
+  const int MAX_SWEEPS = 25;
+  for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep) {
+    double off_diag_sum = 0.0;
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+      for (int j = i + 1; j < BLOCK_SIZE; ++j) {
+        off_diag_sum += abs(S[i][j]);
+      }
+    }
+    if (off_diag_sum < 1e-7)
+      break; // Converged
+
+    for (int i = 0; i < BLOCK_SIZE; ++i) {
+      for (int j = i + 1; j < BLOCK_SIZE; ++j) {
+        if (abs(S[i][j]) < 1e-13)
+          continue;
+
+        // Givens rotation parameters
+        double diff = S[j][j] - S[i][i];
+        double tau = diff / (2.0 * S[i][j]);
+        double t = (tau >= 0.0) ? (1.0 / (tau + sqrt(1.0 + tau * tau)))
+                                : (-1.0 / (-tau + sqrt(1.0 + tau * tau)));
+        double c = 1.0 / sqrt(1.0 + t * t);
+        double s = t * c;
+
+        double h = t * S[i][j];
+        S[i][i] -= h;
+        S[j][j] += h;
+        S[i][j] = 0.0;
+        S[j][i] = 0.0;
+
+        // Rotate rows and columns in S
+        for (int k = 0; k < BLOCK_SIZE; ++k) {
+          if (k != i && k != j) {
+            double ski = S[k][i];
+            double skj = S[k][j];
+            S[k][i] = c * ski - s * skj;
+            S[i][k] = S[k][i];
+            S[k][j] = s * ski + c * skj;
+            S[j][k] = S[k][j];
+          }
+        }
+
+        // Accumulate orthogonal transformation in V
+        for (int k = 0; k < BLOCK_SIZE; ++k) {
+          double vki = V[k][i];
+          double vkj = V[k][j];
+          V[k][i] = c * vki - s * vkj;
+          V[k][j] = s * vki + c * vkj;
+        }
+      }
+    }
+  }
+
+  // 4. Eigenvalues of S are the diagonal entries. Singular values are
+  // sqrt(lambda)
+  struct Component {
+    double sigma;
+    int col;
+  };
+  Component comps[BLOCK_SIZE];
+  for (int i = 0; i < BLOCK_SIZE; ++i) {
+    comps[i].sigma = (S[i][i] > 0.0) ? sqrt(S[i][i]) : 0.0;
+    comps[i].col = i;
+  }
+
+  // Sort singular values in descending order
+  sort(comps, comps + BLOCK_SIZE, [](const Component &a, const Component &b) {
+    return a.sigma > b.sigma;
+  });
+
+  // 5. Extract top K singular values and quantized U & V components
+  for (int r = 0; r < K; ++r) {
+    double sig = comps[r].sigma;
+    outBlock.sigma[r] = static_cast<float>(sig);
+    int v_col = comps[r].col;
+
+    // V vector (r-th component): column v_col of V
+    for (int k = 0; k < BLOCK_SIZE; ++k) {
+      double val = max(-1.0, min(1.0, V[k][v_col]));
+      outBlock.V[r * BLOCK_SIZE + k] =
+          static_cast<std::int8_t>(round(val * 127.0));
+    }
+
+    // U vector (r-th component): u = (A * v) / sig
+    if (sig > 1e-7) {
+      double u[BLOCK_SIZE];
+      double u_norm = 0.0;
+      for (int row = 0; row < BLOCK_SIZE; ++row) {
+        double sum = 0.0;
+        for (int col = 0; col < BLOCK_SIZE; ++col) {
+          sum += static_cast<double>(A[row][col]) * V[col][v_col];
+        }
+        u[row] = sum / sig;
+        u_norm += u[row] * u[row];
+      }
+      u_norm = sqrt(u_norm);
+      if (u_norm > 1e-7) {
+        for (int row = 0; row < BLOCK_SIZE; ++row) {
+          double val = max(-1.0, min(1.0, u[row] / u_norm));
+          outBlock.U[r * BLOCK_SIZE + row] =
+              static_cast<std::int8_t>(round(val * 127.0));
+        }
+      } else {
+        for (int row = 0; row < BLOCK_SIZE; ++row) {
+          outBlock.U[r * BLOCK_SIZE + row] = 0;
+        }
+      }
+    } else {
+      for (int row = 0; row < BLOCK_SIZE; ++row) {
+        outBlock.U[r * BLOCK_SIZE + row] = 0;
+      }
+    }
+  }
+}
+
+// Sequential SVD: Processes 32x32 blocks one after another
+void sequentialSVD(const std::uint8_t *grayImage, int width, int height, int K,
+                   std::vector<SVDBlock> &blocks) {
+  int numBlocksX = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksY = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int totalBlocks = numBlocksX * numBlocksY;
+  blocks.resize(totalBlocks);
+
+  for (int b = 0; b < totalBlocks; ++b) {
+    int bx = b % numBlocksX;
+    int by = b / numBlocksX;
+
+    // Block extraction with boundary clamping
+    float block[BLOCK_SIZE][BLOCK_SIZE];
+    for (int r = 0; r < BLOCK_SIZE; ++r) {
+      int y = min(by * BLOCK_SIZE + r, height - 1);
+      for (int c = 0; c < BLOCK_SIZE; ++c) {
+        int x = min(bx * BLOCK_SIZE + c, width - 1);
+        block[r][c] = static_cast<float>(grayImage[y * width + x]);
+      }
+    }
+
+    // SVD computation + compressed representation generation
+    computeBlockSVD(block, K, blocks[b]);
+  }
+}
+
+// Parallel SVD: Concurrently processes independent 32x32 blocks with OpenMP
+void parallelSVD(const std::uint8_t *grayImage, int width, int height, int K,
+                 std::vector<SVDBlock> &blocks) {
+  int numBlocksX = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksY = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int totalBlocks = numBlocksX * numBlocksY;
+  blocks.resize(totalBlocks);
+
+#pragma omp parallel for schedule(static)
+  for (int b = 0; b < totalBlocks; ++b) {
+    int bx = b % numBlocksX;
+    int by = b / numBlocksX;
+
+    // Block extraction with boundary clamping
+    float block[BLOCK_SIZE][BLOCK_SIZE];
+    for (int r = 0; r < BLOCK_SIZE; ++r) {
+      int y = min(by * BLOCK_SIZE + r, height - 1);
+      for (int c = 0; c < BLOCK_SIZE; ++c) {
+        int x = min(bx * BLOCK_SIZE + c, width - 1);
+        block[r][c] = static_cast<float>(grayImage[y * width + x]);
+      }
+    }
+
+    // SVD computation + compressed representation generation
+    computeBlockSVD(block, K, blocks[b]);
+  }
+}
+
+// Write the custom binary .svd file
+bool writeSVDFile(const string &filename, int width, int height, int K,
+                  int totalBlocks, const std::vector<SVDBlock> &blocks) {
+  ofstream out(filename, ios::binary);
+  if (!out)
+    return false;
+
+  SVDHeader header;
+  header.magic[0] = 'S';
+  header.magic[1] = 'V';
+  header.magic[2] = 'D';
+  header.magic[3] = '1';
+  header.width = static_cast<std::uint32_t>(width);
+  header.height = static_cast<std::uint32_t>(height);
+  header.blockSize = static_cast<std::uint32_t>(BLOCK_SIZE);
+  header.K = static_cast<std::uint32_t>(K);
+  header.totalBlocks = static_cast<std::uint32_t>(totalBlocks);
+
+  out.write(reinterpret_cast<const char *>(&header), sizeof(header));
+
+  for (const auto &b : blocks) {
+    out.write(reinterpret_cast<const char *>(b.sigma.data()),
+              K * sizeof(float));
+    out.write(reinterpret_cast<const char *>(b.U.data()),
+              K * BLOCK_SIZE * sizeof(std::int8_t));
+    out.write(reinterpret_cast<const char *>(b.V.data()),
+              K * BLOCK_SIZE * sizeof(std::int8_t));
+  }
+  return out.good();
+}
+
+// Read the custom binary .svd file and reconstruct the grayscale pixel matrix
+bool readSVDAndReconstruct(const string &filename, int &outWidth,
+                           int &outHeight, int &outK,
+                           std::vector<std::uint8_t> &reconstructedPixels) {
+  ifstream in(filename, ios::binary);
+  if (!in)
+    return false;
+
+  SVDHeader header;
+  if (!in.read(reinterpret_cast<char *>(&header), sizeof(header)))
+    return false;
+
+  if (header.magic[0] != 'S' || header.magic[1] != 'V' ||
+      header.magic[2] != 'D' || header.magic[3] != '1') {
+    cerr << "Error: File '" << filename
+         << "' is not a valid SVD file (invalid magic signature).\n";
+    return false;
+  }
+
+  if (header.blockSize != BLOCK_SIZE || header.K == 0 ||
+      header.K > BLOCK_SIZE) {
+    cerr << "Error: Unsupported or invalid block parameters in .svd file.\n";
+    return false;
+  }
+
+  outWidth = static_cast<int>(header.width);
+  outHeight = static_cast<int>(header.height);
+  outK = static_cast<int>(header.K);
+
+  int numBlocksX = (outWidth + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksY = (outHeight + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int expectedBlocks = numBlocksX * numBlocksY;
+
+  if (header.totalBlocks != static_cast<std::uint32_t>(expectedBlocks)) {
+    cerr << "Error: Block count mismatch in .svd file.\n";
+    return false;
+  }
+
+  reconstructedPixels.assign(outWidth * outHeight, 0);
+
+  std::vector<float> sigma(outK);
+  std::vector<std::int8_t> U(outK * BLOCK_SIZE);
+  std::vector<std::int8_t> V(outK * BLOCK_SIZE);
+
+  for (int b = 0; b < expectedBlocks; ++b) {
+    if (!in.read(reinterpret_cast<char *>(sigma.data()), outK * sizeof(float)))
+      return false;
+    if (!in.read(reinterpret_cast<char *>(U.data()),
+                 outK * BLOCK_SIZE * sizeof(std::int8_t)))
+      return false;
+    if (!in.read(reinterpret_cast<char *>(V.data()),
+                 outK * BLOCK_SIZE * sizeof(std::int8_t)))
+      return false;
+
+    // Reconstruct block: A_approx = sum_{r=0}^{K-1} sigma[r] * u_r * v_r^T
+    float A[BLOCK_SIZE][BLOCK_SIZE] = {0};
+    for (int r = 0; r < outK; ++r) {
+      float sig = sigma[r];
+      for (int i = 0; i < BLOCK_SIZE; ++i) {
+        float ui = static_cast<float>(U[r * BLOCK_SIZE + i]) / 127.0f;
+        for (int j = 0; j < BLOCK_SIZE; ++j) {
+          float vj = static_cast<float>(V[r * BLOCK_SIZE + j]) / 127.0f;
+          A[i][j] += sig * ui * vj;
+        }
+      }
+    }
+
+    // Place into image matrix with clamping to [0, 255]
+    int bx = b % numBlocksX;
+    int by = b / numBlocksX;
+    for (int r = 0; r < BLOCK_SIZE; ++r) {
+      int y = by * BLOCK_SIZE + r;
+      if (y >= outHeight)
+        continue;
+      for (int c = 0; c < BLOCK_SIZE; ++c) {
+        int x = bx * BLOCK_SIZE + c;
+        if (x >= outWidth)
+          continue;
+        float val = A[r][c];
+        int ival = static_cast<int>(round(val));
+        if (ival < 0)
+          ival = 0;
+        if (ival > 255)
+          ival = 255;
+        reconstructedPixels[y * outWidth + x] = static_cast<std::uint8_t>(ival);
+      }
+    }
+  }
+  return true;
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 5) {
+    cerr << "Usage: " << argv[0]
+         << " <input.jpg> <compressed.svd> <reconstructed.jpg> <K>\n";
+    cerr << "Example: " << argv[0]
+         << " input.jpg compressed.svd reconstructed.jpg 8\n";
+    return 1;
+  }
+
+  string inputJpegPath = argv[1];
+  string compressedSvdPath = argv[2];
+  string reconstructedJpegPath = argv[3];
+  int K = stoi(argv[4]);
+
+  if (K < 1 || K > BLOCK_SIZE) {
+    cerr << "Error: K must be between 1 and " << BLOCK_SIZE
+         << " (received K = " << K << ").\n";
+    return 1;
+  }
+
+  // 1. Read input JPEG file into memory
+  ifstream inFile(inputJpegPath, ios::binary | ios::ate);
+  if (!inFile) {
+    cerr << "Error: Cannot open input JPEG file: " << inputJpegPath << "\n";
+    return 1;
+  }
+  streamsize originalJpegSize = inFile.tellg();
+  inFile.seekg(0, ios::beg);
+  vector<unsigned char> jpegBuffer(originalJpegSize);
+  if (!inFile.read(reinterpret_cast<char *>(jpegBuffer.data()),
+                   originalJpegSize)) {
+    cerr << "Error: Failed to read input JPEG file: " << inputJpegPath << "\n";
+    return 1;
+  }
+  inFile.close();
+
+  // 2. Decode JPEG to grayscale using libjpeg-turbo (TurboJPEG API)
+  tjhandle decompressor = tjInitDecompress();
+  if (!decompressor) {
+    cerr << "Error: tjInitDecompress failed: " << tjGetErrorStr() << "\n";
+    return 1;
+  }
+
+  int width = 0, height = 0, jpegSubsamp = 0, jpegColorspace = 0;
+  if (tjDecompressHeader3(decompressor, jpegBuffer.data(), originalJpegSize,
+                          &width, &height, &jpegSubsamp, &jpegColorspace) < 0) {
+    cerr << "Error: tjDecompressHeader3 failed: " << tjGetErrorStr() << "\n";
+    tjDestroy(decompressor);
+    return 1;
+  }
+
+  std::vector<std::uint8_t> rawPixels(width * height);
+  if (tjDecompress2(decompressor, jpegBuffer.data(), originalJpegSize,
+                    rawPixels.data(), width, 0, height, TJPF_GRAY, 0) < 0) {
+    cerr << "Error: tjDecompress2 failed: " << tjGetErrorStr() << "\n";
+    tjDestroy(decompressor);
+    return 1;
+  }
+  tjDestroy(decompressor);
+
+  size_t rawImageSize =
+      static_cast<size_t>(width) * static_cast<size_t>(height);
+  int numBlocksX = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int numBlocksY = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int totalBlocks = numBlocksX * numBlocksY;
+
+  // 3. Benchmark Sequential SVD (Block extraction + SVD computation + SVD
+  // representation)
+  vector<SVDBlock> seqBlocks;
+  double t_seq_start = omp_get_wtime();
+  sequentialSVD(rawPixels.data(), width, height, K, seqBlocks);
+  double t_seq_end = omp_get_wtime();
+  double seqTime = t_seq_end - t_seq_start;
+
+  // 4. Benchmark Parallel SVD (Block extraction + SVD computation + SVD
+  // representation)
+  vector<SVDBlock> parBlocks;
+  double t_par_start = omp_get_wtime();
+  parallelSVD(rawPixels.data(), width, height, K, parBlocks);
+  double t_par_end = omp_get_wtime();
+  double parTime = t_par_end - t_par_start;
+
+  int openmpThreads = omp_get_max_threads();
+  double speedup = (parTime > 0.0) ? (seqTime / parTime) : 0.0;
+  double efficiency =
+      (openmpThreads > 0) ? (speedup / openmpThreads * 100.0) : 0.0;
+
+  // 5. Write custom binary SVD compressed file (.svd)
+  if (!writeSVDFile(compressedSvdPath, width, height, K, totalBlocks,
+                    parBlocks)) {
+    cerr << "Error: Failed to write custom SVD compressed file: "
+         << compressedSvdPath << "\n";
+    return 1;
+  }
+
+  // Determine SVD file size
+  ifstream svdFileCheck(compressedSvdPath, ios::binary | ios::ate);
+  size_t svdFileSize =
+      svdFileCheck ? static_cast<size_t>(svdFileCheck.tellg()) : 0;
+  svdFileCheck.close();
+
+  double compressionRatio =
+      (svdFileSize > 0) ? (static_cast<double>(rawImageSize) / svdFileSize)
+                        : 0.0;
+  double spaceSaved =
+      (rawImageSize > 0)
+          ? ((1.0 - static_cast<double>(svdFileSize) / rawImageSize) * 100.0)
+          : 0.0;
+
+  // 6. Decode .svd file and reconstruct pixel matrix
+  std::vector<std::uint8_t> reconstructedPixels;
+  int recWidth = 0, recHeight = 0, recK = 0;
+  if (!readSVDAndReconstruct(compressedSvdPath, recWidth, recHeight, recK,
+                             reconstructedPixels)) {
+    cerr << "Error: Failed to decode and reconstruct from .svd file: "
+         << compressedSvdPath << "\n";
+    return 1;
+  }
+
+  // 7. Calculate image quality metrics (MSE and PSNR)
+  double totalSquaredError = 0.0;
+  for (size_t i = 0; i < rawPixels.size(); ++i) {
+    double diff = static_cast<double>(rawPixels[i]) -
+                  static_cast<double>(reconstructedPixels[i]);
+    totalSquaredError += diff * diff;
+  }
+  double mse = totalSquaredError / static_cast<double>(rawPixels.size());
+  double psnr = 0.0;
+  if (mse <= 1e-10) {
+    psnr = 99.99; // Virtually lossless
+  } else {
+    psnr = 10.0 * log10((255.0 * 255.0) / mse);
+  }
+
+  // 8. Encode reconstructed pixel matrix to JPEG using libjpeg-turbo
+  tjhandle compressor = tjInitCompress();
+  if (!compressor) {
+    cerr << "Error: tjInitCompress failed: " << tjGetErrorStr() << "\n";
+    return 1;
+  }
+
+  unsigned char *outJpegBuf = nullptr;
+  unsigned long outJpegSize = 0;
+  int jpegQuality = 90; // High quality encode for reconstructed image
+  if (tjCompress2(compressor, reconstructedPixels.data(), width, 0, height,
+                  TJPF_GRAY, &outJpegBuf, &outJpegSize, TJSAMP_GRAY,
+                  jpegQuality, 0) < 0) {
+    cerr << "Error: tjCompress2 failed: " << tjGetErrorStr() << "\n";
+    tjDestroy(compressor);
+    return 1;
+  }
+
+  ofstream recFile(reconstructedJpegPath, ios::binary);
+  if (!recFile) {
+    cerr << "Error: Cannot open output reconstructed JPEG file: "
+         << reconstructedJpegPath << "\n";
+    tjFree(outJpegBuf);
+    tjDestroy(compressor);
+    return 1;
+  }
+  recFile.write(reinterpret_cast<const char *>(outJpegBuf), outJpegSize);
+  recFile.close();
+
+  tjFree(outJpegBuf);
+  tjDestroy(compressor);
+
+  // 9. Verification check
+  bool verificationSuccess =
+      (recWidth == width && recHeight == height && recK == K &&
+       reconstructedPixels.size() == rawPixels.size());
+
+  // 10. Print clean, structured report
+  cout << "\n========== SVD IMAGE COMPRESSION ==========\n\n";
+  cout << "Image              : " << width << " x " << height << "\n";
+  cout << "Block Size         : " << BLOCK_SIZE << " x " << BLOCK_SIZE << "\n";
+  cout << "K                  : " << K << "\n";
+  cout << "OpenMP Threads     : " << openmpThreads << "\n\n";
+
+  cout << fixed << setprecision(3);
+  cout << "Sequential SVD Time: " << seqTime << " sec\n";
+  cout << "Parallel SVD Time  : " << parTime << " sec\n\n";
+
+  cout << fixed << setprecision(2);
+  cout << "Speedup            : " << speedup << "x\n";
+  cout << "Efficiency         : " << efficiency << "%\n\n";
+
+  cout << "Raw Image Size     : " << rawImageSize << " bytes\n";
+  cout << "SVD File Size      : " << svdFileSize << " bytes\n";
+  cout << "Compression Ratio  : " << compressionRatio << ":1\n";
+  cout << "Space Saved        : " << spaceSaved << "%\n\n";
+
+  cout << "MSE                : " << mse << "\n";
+  cout << "PSNR               : " << psnr << " dB\n\n";
+
+  cout << "Original JPEG Size : " << originalJpegSize << " bytes\n";
+  cout << "Reconstructed JPEG : " << outJpegSize << " bytes\n\n";
+
+  cout << "Verification       : "
+       << (verificationSuccess ? "Successful" : "Failed") << "\n\n";
+  cout << "============================================\n\n";
+
+  return 0;
+}
+
+execution command :-
+.\svd_compressor.exe input.jpg compressed.svd reconstructed.jpg 8

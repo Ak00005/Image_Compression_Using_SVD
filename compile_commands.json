@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "C:/PC_Project",
+    "command": "C:/mingw64/bin/g++.exe --target=x86_64-w64-windows-gnu -std=c++17 -O2 -fopenmp -IC:/libjpeg-turbo-gcc64/include -c main.cpp",
+    "file": "main.cpp"
+  }
+]
